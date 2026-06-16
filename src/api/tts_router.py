@@ -61,6 +61,7 @@ _ALLOWED_AUDIO_TTS_VOICES = frozenset(
     }
 )
 _SENTENCE_SILENCE_SECONDS = 0.05
+_TTS_MAX_CONCURRENT_REQUESTS = 10
 
 router = APIRouter()
 
@@ -230,6 +231,39 @@ def _extract_wav_frames(wav_bytes: bytes) -> Tuple[bytes, dict]:
     return frames, params
 
 
+async def _synthesize_sentence_with_limit(
+    semaphore: asyncio.Semaphore,
+    openai_svc: AzureOpenAIService,
+    sentence: str,
+    *,
+    voice: str,
+    instructions: str,
+) -> bytes:
+    """
+    Sintetiza una oración respetando el límite de concurrencia hacia Azure TTS.
+
+    Usa un semáforo para garantizar que no más de _TTS_MAX_CONCURRENT_REQUESTS
+    llamadas a Azure estén activas al mismo tiempo dentro de una misma petición.
+
+    Args:
+        semaphore: Controla cuántas llamadas simultáneas se permiten.
+        openai_svc: Cliente de Azure OpenAI TTS.
+        sentence: Texto de la oración a vocalizar.
+        voice: Voz del proveedor (p. ej. sage).
+        instructions: Instrucciones de estilo de habla.
+
+    Returns:
+        Bytes del audio WAV correspondiente a la oración.
+    """
+    async with semaphore:
+        return await openai_svc.synthesize_speech(
+            sentence,
+            voice=voice,
+            instructions=instructions,
+            response_format="wav",
+        )
+
+
 @router.post(
     "/audio-tts",
     response_model=TTSArticleChunkedMp3AudioResponse,
@@ -395,13 +429,22 @@ async def create_article_audios(
                     message="La voz solicitada no está permitida. Use 'marin', 'marin1', 'marin2' o 'cedar'.",
                     request_id=request_id,
                 )
+            semaphore = asyncio.Semaphore(_TTS_MAX_CONCURRENT_REQUESTS)
+            logger.info(
+                "tts_request request_id=%s story_id=%s phase=tts_start sentences=%s max_concurrent=%s",
+                request_id,
+                story_id,
+                len(sentences),
+                _TTS_MAX_CONCURRENT_REQUESTS,
+            )
             wav_results = await asyncio.gather(
                 *[
-                    openai.synthesize_speech(
+                    _synthesize_sentence_with_limit(
+                        semaphore,
+                        openai,
                         sentence,
                         voice=provider_voice,
                         instructions=instructions,
-                        response_format="wav",
                     )
                     for sentence in sentences
                 ]
